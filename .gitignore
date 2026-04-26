@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+dashboard-ui/node_modules/
+
+# Environment — NEVER commit real .env
+.env
+.env.local
+.env.production
+.env.*.local
+
+# Build output
+dist/
+build/
+dashboard-ui/dist/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker local volumes
+.docker/
+postgres_data/
+redis_data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage/
+
+# Database
+*.db
+*.sqlite
+*.sql.gz
+
+# Keys / certs (extra safety net)
+*.pem
+*.key
+*.p12
+*.pfx
