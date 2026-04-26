@@ -1,0 +1,122 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:16-alpine
+    container_name: copy-trading-db
+    environment:
+      POSTGRES_DB: copy_trading
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme123}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trader -d copy_trading"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - trading-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: copy-trading-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - trading-network
+
+  # Copy Trading Agent
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: copy-trading-agent
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://trader:${DB_PASSWORD:-changeme123}@postgres:5432/copy_trading
+      REDIS_URL: redis://redis:6379
+
+      # Force IPv4 — Docker containers lack IPv6 routing to external hosts
+      NODE_OPTIONS: --dns-result-order=ipv4first
+
+      # Blockchain RPC
+      ALCHEMY_API_KEY: ${ALCHEMY_API_KEY}
+      ARBITRUM_RPC: wss://arb-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
+
+      # Wallet
+      PRIVATE_KEY: ${PRIVATE_KEY}
+      BOT_ADDRESS: ${BOT_ADDRESS}
+
+      # APIs
+      ANTHROPIC_FOUNDRY_RESOURCE: ${ANTHROPIC_FOUNDRY_RESOURCE}
+      ANTHROPIC_FOUNDRY_API_KEY: ${ANTHROPIC_FOUNDRY_API_KEY}
+      ANTHROPIC_DEFAULT_SONNET_MODEL: ${ANTHROPIC_DEFAULT_SONNET_MODEL:-claude-sonnet-4-6}
+      AZURE_FOUNDRY_ENDPOINT: ${AZURE_FOUNDRY_ENDPOINT}
+      NANSEN_API_KEY: ${NANSEN_API_KEY}
+      ONEINCH_API_KEY: ${ONEINCH_API_KEY}
+      ARBISCAN_API_KEY: ${ARBISCAN_API_KEY}
+
+      # Telegram
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+
+      # Trading Config
+      AUTONOMY_MODE: hybrid
+      POSITION_SIZE_PCT: 0.02
+      MAX_POSITIONS: 5
+      DAILY_LOSS_LIMIT: 0.10
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "3001:3001"
+    volumes:
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - trading-network
+
+  # Grafana Dashboard (Optional - for monitoring)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: copy-trading-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin123}
+      GF_INSTALL_PLUGINS: redis-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+    networks:
+      - trading-network
+    profiles:
+      - monitoring
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  trading-network:
+    driver: bridge
