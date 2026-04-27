@@ -132,11 +132,7 @@ cp .env.example .env   # fill in all required values
 Required environment variables:
 
 ```env
-# Claude (Azure AI Foundry)
-ANTHROPIC_FOUNDRY_API_KEY=
-ANTHROPIC_FOUNDRY_RESOURCE=
-ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-6
-AZURE_FOUNDRY_ENDPOINT=
+# LLM API KEYs
 
 # Arbitrum
 ALCHEMY_API_KEY=
