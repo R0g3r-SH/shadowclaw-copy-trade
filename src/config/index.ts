@@ -22,6 +22,7 @@ export const config = {
     alchemy: {
       apiKey: process.env.ALCHEMY_API_KEY || '',
       rpcUrl: process.env.ARBITRUM_RPC || `wss://arb-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`,
+      httpRpcUrl: process.env.ARBITRUM_HTTP_RPC || 'https://arbitrum.publicnode.com',
     },
     chainId: 42161, // Arbitrum
     chainName: 'arbitrum',
@@ -43,7 +44,10 @@ export const config = {
       resource: process.env.ANTHROPIC_FOUNDRY_RESOURCE || '',
       apiKey: process.env.ANTHROPIC_FOUNDRY_API_KEY || '',
       model: process.env.ANTHROPIC_DEFAULT_SONNET_MODEL || 'claude-sonnet-4-6',
-      foundryEndpoint: process.env.AZURE_FOUNDRY_ENDPOINT || 'https://your-resource.services.ai.azure.com/api/projects/opencode',
+      foundryEndpoint: process.env.AZURE_FOUNDRY_ENDPOINT ||
+        (process.env.ANTHROPIC_FOUNDRY_RESOURCE
+          ? `https://${process.env.ANTHROPIC_FOUNDRY_RESOURCE}.services.ai.azure.com/anthropic/v1/messages`
+          : 'https://your-resource.services.ai.azure.com/anthropic/v1/messages'),
       apiVersion: '2024-12-01-preview',
     },
     nansen: {
@@ -53,7 +57,7 @@ export const config = {
     },
     oneInch: {
       apiKey: process.env.ONEINCH_API_KEY || '',
-      baseUrl: 'https://api.1inch.io/v6.0',
+      baseUrl: 'https://api.1inch.dev/swap/v6.0',
       chainId: 42161, // Arbitrum
     },
     goPlus: {
@@ -70,7 +74,7 @@ export const config = {
   telegram: {
     botToken: process.env.TELEGRAM_BOT_TOKEN || '',
     chatId: process.env.TELEGRAM_CHAT_ID || '',
-    approvalTimeout: 5 * 60 * 1000, // 5 minutes
+    approvalTimeout: 90 * 1000, // 90 seconds — hot signals go cold fast
   },
 
   // Trading Configuration
@@ -87,7 +91,7 @@ export const config = {
   // Risk Management
   risk: {
     maxRiskScore: 50, // Block if higher
-    minLiquidityUsd: 50000, // $50k minimum
+    minLiquidityUsd: 25000, // $25k minimum — catches early-stage gems
     maxSlippage: {
       stable: 0.01,      // 1% for stablecoins
       established: 0.02, // 2% for established tokens
@@ -142,7 +146,8 @@ export const ROUTERS = {
   swapRouter02: '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45',
   sushiswap:    '0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506',
   oneInch:      '0x1111111254EEB25477B68fb85Ed929f73A960582',
-  camelot:      '0xc873fEcbd354f5A56E00E710B90EF4201db2448d',
+  camelot:      '0xc873fEcbd354f5A56E00E710B90EF4201db2448d', // Camelot V2 AMM
+  camelotV3:    '0x1F721E2E82F6676FCE4eA07A5958cF098D339e18', // Camelot V3 (Uniswap V3 fork)
   paraswap:     '0xDEF171Fe48CF0115B1d80b88dc8eAB59176FEe57', // Augustus V5
   odos:         '0xa669e7A0d4b3e4Fa48af2dE86BD4CD7126Be4e13', // Odos Router V2
   balancer:     '0xBA12222222228d8Ba445958a75a0704d566BF2C8', // Balancer Vault

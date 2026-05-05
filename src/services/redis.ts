@@ -125,6 +125,30 @@ export class RedisService {
     return result === 'OK'; // true = first time seen, false = duplicate
   }
 
+  // Per-token processing lock — prevents race condition where two signals for same token
+  // both pass the alreadyHeld check before either inserts a trade record
+  async acquireTokenLock(tokenAddress: string, ttlSeconds = 90): Promise<boolean> {
+    const result = await this.client.set(
+      `lock:token:${tokenAddress.toLowerCase()}`,
+      '1', 'EX', ttlSeconds, 'NX'
+    );
+    return result === 'OK';
+  }
+
+  async releaseTokenLock(tokenAddress: string): Promise<void> {
+    await this.client.del(`lock:token:${tokenAddress.toLowerCase()}`);
+  }
+
+  // Last trade signal timestamp — used by BriefingAgent to detect inactivity
+  async setLastSignalTime(): Promise<void> {
+    await this.set('monitor:last_signal', Date.now().toString(), 24 * 3600);
+  }
+
+  async getLastSignalTime(): Promise<number> {
+    const val = await this.get('monitor:last_signal');
+    return val ? parseInt(val) : Date.now();
+  }
+
   // Pending approvals
   async setPendingApproval(requestId: number, data: any, ttlSeconds: number = 300): Promise<void> {
     await this.setJSON(`approval:${requestId}`, data, ttlSeconds);

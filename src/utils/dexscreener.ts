@@ -5,6 +5,10 @@ export interface TokenMarketData {
   priceUsd: number;
   liquidityUsd: number;
   volume24h: number;
+  priceChangeH1: number | null;
+  priceChangeH24: number | null;
+  fdv: number | null;
+  pairCreatedAt: number | null; // unix ms — to detect very new tokens
 }
 
 const cache = new Map<string, { data: TokenMarketData; expiry: number }>();
@@ -28,12 +32,23 @@ export async function getTokenMarketData(tokenAddress: string): Promise<TokenMar
     )[0];
 
     const data: TokenMarketData = {
-      priceUsd: parseFloat(best.priceUsd || '0') || 0,
-      liquidityUsd: best.liquidity?.usd || 0,
-      volume24h: best.volume?.h24 || 0,
+      priceUsd:       parseFloat(best.priceUsd || '0') || 0,
+      liquidityUsd:   best.liquidity?.usd || 0,
+      volume24h:      best.volume?.h24 || 0,
+      priceChangeH1:  best.priceChange?.h1  != null ? parseFloat(best.priceChange.h1)  : null,
+      priceChangeH24: best.priceChange?.h24 != null ? parseFloat(best.priceChange.h24) : null,
+      fdv:            best.fdv ?? null,
+      pairCreatedAt:  best.pairCreatedAt ?? null,
     };
 
     cache.set(key, { data, expiry: Date.now() + CACHE_TTL });
+
+    // Evict expired entries periodically to prevent unbounded growth
+    if (cache.size > 200) {
+      const now = Date.now();
+      for (const [k, v] of cache) { if (v.expiry < now) cache.delete(k); }
+    }
+
     return data;
   } catch {
     logger.debug({ tokenAddress }, 'DEXScreener fetch failed');
@@ -41,9 +56,9 @@ export async function getTokenMarketData(tokenAddress: string): Promise<TokenMar
   }
 }
 
-const WETH_ARBITRUM = '0x82af49447d8a07e3bd95bd0d56f35241523fbab1';
+import { WETH_ADDRESS } from '../constants/tokens';
 
 export async function getEthPriceUsd(): Promise<number> {
-  const data = await getTokenMarketData(WETH_ARBITRUM);
+  const data = await getTokenMarketData(WETH_ADDRESS);
   return data?.priceUsd || 2000;
 }

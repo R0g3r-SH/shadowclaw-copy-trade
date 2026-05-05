@@ -5,12 +5,12 @@ import {
   createPublicClient,
   type WalletClient,
   type Hash,
-  formatUnits,
 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { arbitrum } from 'viem/chains';
 import { logger } from '../utils/logger';
 import { config } from '../config';
+import { WETH_ADDRESS, ERC20_BALANCE_ABI } from '../constants/tokens';
 import { DatabaseService } from '../services/database';
 
 export interface TradeParams {
@@ -29,8 +29,6 @@ export interface ExecutionResult {
   error?: string;
 }
 
-const WETH_ARBITRUM = '0x82af49447d8a07e3bd95bd0d56f35241523fbab1';
-const ALCHEMY_RPC = `https://arb-mainnet.g.alchemy.com/v2/${config.blockchain.alchemy.apiKey}`;
 
 export class TradeExecutor {
   private walletClient: WalletClient;
@@ -40,16 +38,15 @@ export class TradeExecutor {
   constructor(_db: DatabaseService) {
     this.account = privateKeyToAccount(config.wallet.privateKey as `0x${string}`);
 
-    // Flashbots doesn't support Arbitrum — use Alchemy directly
     this.walletClient = createWalletClient({
       account: this.account,
       chain: arbitrum,
-      transport: http(ALCHEMY_RPC),
+      transport: http(config.blockchain.alchemy.httpRpcUrl),
     });
 
     this.publicClient = createPublicClient({
       chain: arbitrum,
-      transport: http(ALCHEMY_RPC),
+      transport: http(config.blockchain.alchemy.httpRpcUrl),
     });
 
     logger.info(`Trade executor initialized with address: ${this.account.address}`);
@@ -61,55 +58,79 @@ export class TradeExecutor {
       logger.info(`  ${params.tokenIn.slice(0, 8)}... → ${params.tokenOut.slice(0, 8)}...`);
 
       // Step 1: Ensure ERC20 approval if tokenIn is not native WETH (buys use ETH value)
-      if (params.tokenIn.toLowerCase() !== WETH_ARBITRUM.toLowerCase()) {
+      if (params.tokenIn.toLowerCase() !== WETH_ADDRESS) {
         const approved = await this.ensureApproved(params.tokenIn, params.amountIn);
         if (!approved) {
           return { success: false, error: 'Token approval failed' };
         }
       }
 
-      // Step 2: Get quote from 1inch
-      const quote = await this.get1InchQuote(params);
-      if (!quote) {
-        return { success: false, error: '1inch quote failed' };
-      }
-
-      logger.info(`Quote received: ${formatUnits(BigInt(quote.toAmount), 18)} tokens out`);
-
-      // Step 3: Build transaction
-      const tx = await this.build1InchSwap(params);
-      if (!tx) {
+      // Step 2: Build swap tx via 1inch
+      const swapData = await this.build1InchSwap(params);
+      if (!swapData) {
         return { success: false, error: '1inch swap build failed' };
       }
 
+      const { tx, dstAmount } = swapData;
+      logger.info(`Swap quote: ${dstAmount} tokens out (minimum, raw)`);
+
+      // Step 3: Read outToken balance BEFORE the swap so we can compute the exact delta.
+      // Reading total balance after is wrong — the wallet may already hold some of tokenOut
+      // (especially USDC on sells), which inflates amountOut and corrupts P&L tracking.
+      const outToken = params.tokenOut as `0x${string}`;
+      let balanceBefore = 0n;
+      try {
+        balanceBefore = await this.publicClient.readContract({
+          address: outToken,
+          abi: ERC20_BALANCE_ABI,
+          functionName: 'balanceOf',
+          args: [this.account.address],
+        });
+      } catch { /* treat as 0; delta will fall back to dstAmount */ }
+
       // Step 4: Execute transaction
+      // Do NOT pass gas from 1inch when disableEstimate=true — their estimate is often too low.
+      // Let viem estimate gas properly via eth_estimateGas.
       logger.info('Sending transaction...');
       const txHash = await this.walletClient.sendTransaction({
         account: this.account,
         to: tx.to as `0x${string}`,
         data: tx.data as `0x${string}`,
         value: tx.value ? BigInt(tx.value) : 0n,
-        gas: tx.gas ? BigInt(tx.gas) : undefined,
         chain: arbitrum,
       });
 
       logger.info(`Transaction sent: ${txHash}`);
 
-      // Step 5: Wait for confirmation
-      const receipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+      // Step 5: Wait for confirmation — 90s timeout prevents indefinite hang on stuck txs
+      const receipt = await this.publicClient.waitForTransactionReceipt({
+        hash: txHash,
+        timeout: 90_000,
+      });
 
       if (receipt.status === 'success') {
         logger.info(`✅ Trade executed successfully: ${txHash}`);
         const gasCost = receipt.gasUsed * receipt.effectiveGasPrice;
-        return {
-          success: true,
-          txHash: receipt.transactionHash,
-          amountOut: BigInt(quote.toAmount),
-          gasCost,
-        };
+
+        let amountOut: bigint;
+        try {
+          const balanceAfter = await this.publicClient.readContract({
+            address: outToken,
+            abi: ERC20_BALANCE_ABI,
+            functionName: 'balanceOf',
+            args: [this.account.address],
+          });
+          // Delta = exactly what the swap produced, regardless of pre-existing balance
+          amountOut = balanceAfter > balanceBefore ? balanceAfter - balanceBefore : BigInt(dstAmount);
+          logger.info(`Received: ${amountOut} (before: ${balanceBefore}, after: ${balanceAfter}, quote min: ${dstAmount})`);
+        } catch {
+          amountOut = BigInt(dstAmount);
+        }
+
+        return { success: true, txHash: receipt.transactionHash, amountOut, gasCost };
       } else {
-        logger.error(`Transaction failed: ${txHash}`);
-        return { success: false, error: 'Transaction reverted' };
+        logger.error(`Transaction reverted: ${txHash}`);
+        return { success: false, error: 'Transaction reverted on-chain' };
       }
 
     } catch (error: any) {
@@ -119,26 +140,40 @@ export class TradeExecutor {
   }
 
   private async ensureApproved(tokenAddress: string, amount: bigint): Promise<boolean> {
+    const approveUrl = `${config.apis.oneInch.baseUrl}/${config.apis.oneInch.chainId}/approve/transaction`;
+
     try {
-      const allowanceUrl = `${config.apis.oneInch.baseUrl}/${config.apis.oneInch.chainId}/approve/allowance`;
-      const allowanceRes = await axios.get(allowanceUrl, {
-        params: { tokenAddress, walletAddress: this.account.address },
-        headers: { 'Authorization': `Bearer ${config.apis.oneInch.apiKey}` },
-        timeout: 8000,
-      });
+      // Try to check current allowance first — skip approve if already sufficient
+      try {
+        const allowanceUrl = `${config.apis.oneInch.baseUrl}/${config.apis.oneInch.chainId}/approve/allowance`;
+        const allowanceRes = await axios.get(allowanceUrl, {
+          params: { tokenAddress, walletAddress: this.account.address },
+          headers: { 'Authorization': `Bearer ${config.apis.oneInch.apiKey}` },
+          timeout: 6000,
+        });
+        const allowance = BigInt(String(allowanceRes.data?.allowance || '0').split('.')[0]);
+        if (allowance >= amount) {
+          logger.debug(`${tokenAddress.slice(0, 8)} already approved (allowance sufficient)`);
+          return true;
+        }
+      } catch {
+        // Allowance check failed — proceed to approve anyway; idempotent on-chain
+        logger.debug(`Allowance check failed for ${tokenAddress.slice(0, 8)} — approving anyway`);
+      }
 
-      const allowance = BigInt(allowanceRes.data.allowance || '0');
-      if (allowance >= amount) return true;
-
-      logger.info(`Approving ${tokenAddress.slice(0, 8)}... for 1inch`);
-      const approveUrl = `${config.apis.oneInch.baseUrl}/${config.apis.oneInch.chainId}/approve/transaction`;
+      logger.info(`Approving ${tokenAddress.slice(0, 8)}... for 1inch (MaxUint256)`);
       const approveRes = await axios.get(approveUrl, {
-        params: { tokenAddress, amount: amount.toString() },
+        params: { tokenAddress }, // no amount = MaxUint256
         headers: { 'Authorization': `Bearer ${config.apis.oneInch.apiKey}` },
         timeout: 8000,
       });
 
       const approveTx = approveRes.data;
+      if (!approveTx?.to || !approveTx?.data) {
+        logger.error({ approveTx, status: approveRes.status }, 'Invalid approve transaction from 1inch — missing to/data fields');
+        return false;
+      }
+
       const txHash = await this.walletClient.sendTransaction({
         account: this.account,
         to: approveTx.to as `0x${string}`,
@@ -147,53 +182,52 @@ export class TradeExecutor {
         chain: arbitrum,
       });
 
-      await this.publicClient.waitForTransactionReceipt({ hash: txHash });
+      const approveReceipt = await this.publicClient.waitForTransactionReceipt({ hash: txHash, timeout: 60_000 });
+      if (approveReceipt.status !== 'success') {
+        logger.error(`Approval tx reverted on-chain: ${txHash}`);
+        return false;
+      }
       logger.info(`Token approved: ${txHash}`);
       return true;
 
     } catch (error: any) {
-      logger.error({ error: error.response?.data || error.message }, 'Token approval failed');
+      const detail = error.response?.data ?? error.message;
+      const status = error.response?.status;
+      logger.error({ status, detail }, 'Token approval failed');
+      if (status === 401 || status === 403) {
+        logger.error('1inch API key is missing or invalid — check ONEINCH_API_KEY env var');
+      }
       return false;
     }
   }
 
-  private async get1InchQuote(params: TradeParams): Promise<any> {
-    try {
-      const url = `${config.apis.oneInch.baseUrl}/${config.apis.oneInch.chainId}/quote`;
-      const response = await axios.get(url, {
-        params: {
-          src: params.tokenIn,
-          dst: params.tokenOut,
-          amount: params.amountIn.toString(),
-        },
-        headers: { 'Authorization': `Bearer ${config.apis.oneInch.apiKey}` },
-        timeout: 10000,
-      });
-      return response.data;
-    } catch (error: any) {
-      logger.error({ error: error.response?.data || error.message }, '1inch quote failed');
-      return null;
-    }
-  }
-
-  private async build1InchSwap(params: TradeParams): Promise<any> {
+  private async build1InchSwap(params: TradeParams): Promise<{ tx: any; dstAmount: string } | null> {
     try {
       const url = `${config.apis.oneInch.baseUrl}/${config.apis.oneInch.chainId}/swap`;
+      const reqParams = {
+        src: params.tokenIn,
+        dst: params.tokenOut,
+        amount: params.amountIn.toString(),
+        from: this.account.address,
+        slippage: params.slippagePct,
+        disableEstimate: true,
+      };
+      logger.info({ url, params: reqParams }, '1inch swap request');
       const response = await axios.get(url, {
-        params: {
-          src: params.tokenIn,
-          dst: params.tokenOut,
-          amount: params.amountIn.toString(),
-          from: this.account.address,
-          slippage: params.slippagePct,
-          disableEstimate: true,
-        },
+        params: reqParams,
         headers: { 'Authorization': `Bearer ${config.apis.oneInch.apiKey}` },
         timeout: 10000,
       });
-      return response.data.tx;
+      const { tx, dstAmount, error, description } = response.data;
+      if (!tx || !dstAmount) {
+        logger.error({ status: response.status, error, description, keys: Object.keys(response.data) }, '1inch response missing tx/dstAmount');
+        return null;
+      }
+      logger.info({ dstAmount, to: tx.to, gas: tx.gas }, '1inch swap OK');
+      return { tx, dstAmount };
     } catch (error: any) {
-      logger.error({ error: error.response?.data || error.message }, '1inch swap build failed');
+      const detail = error.response?.data ?? error.message;
+      logger.error({ status: error.response?.status, detail }, '1inch swap API error');
       return null;
     }
   }

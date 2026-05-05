@@ -9,24 +9,36 @@ import {
 import { arbitrum } from 'viem/chains';
 import { TradeOrchestrator, type TradeSignal } from '../orchestrator';
 import { logger } from '../utils/logger';
-import { config, ROUTERS, SWAP_SELECTORS } from '../config';
+import { ROUTERS, SWAP_SELECTORS } from '../config';
+import { WETH_ADDRESS } from '../constants/tokens';
 import { DatabaseService } from '../services/database';
 import type { WalletDiscoveryService } from '../discovery/wallet-discovery';
 import { dash } from '../dashboard/events';
 
+const WS_ENDPOINTS = [
+  process.env.ARBITRUM_RPC || 'wss://arbitrum-one-rpc.publicnode.com',
+  'wss://arbitrum.drpc.org',
+  'wss://arbitrum.publicnode.com',
+  // Alchemy last — monthly limit often exhausted
+  process.env.ALCHEMY_API_KEY
+    ? `wss://arb-mainnet.g.alchemy.com/v2/${process.env.ALCHEMY_API_KEY}`
+    : null,
+].filter(Boolean) as string[];
+
 export class WebSocketMonitor {
   private client: PublicClient | null = null;
   private isRunning = false;
-  private isConnecting = false; // prevent concurrent reconnects
+  private isConnecting = false;
   private paused = false;
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 10;
+  private maxReconnectAttempts = 30; // across all endpoints
+  private endpointIndex = 0;
   private trackedWallets: Set<string> = new Set();
   private discovery: WalletDiscoveryService | null = null;
 
   constructor(
     private orchestrator: TradeOrchestrator,
-    private db: DatabaseService
+    private db: DatabaseService,
   ) {}
 
   setDiscovery(discovery: WalletDiscoveryService): void {
@@ -58,24 +70,31 @@ export class WebSocketMonitor {
   }
 
   private async connect(): Promise<void> {
-    if (this.isConnecting) return; // already in progress
+    if (this.isConnecting) return;
     this.isConnecting = true;
+    let errorFired = false;
+
+    // Close previous transport before creating a new one — prevents stale socket errors
+    // from the old client firing onError on the new connect() call
+    if (this.client) {
+      try { (this.client.transport as any)?.socket?.close?.(); } catch {}
+      this.client = null;
+    }
+
     try {
-      logger.info('Connecting to Alchemy WebSocket...');
+      const endpoint = WS_ENDPOINTS[this.endpointIndex % WS_ENDPOINTS.length];
+      const shortEp = endpoint.replace('wss://', '').split('/')[0];
+      logger.info(`Connecting to WebSocket (${endpoint})...`);
+      dash.emit('ws_status', { status: 'connecting', endpoint: shortEp, attempt: this.reconnectAttempts });
 
       this.client = createPublicClient({
         chain: arbitrum,
-        transport: webSocket(config.blockchain.alchemy.rpcUrl, {
-          keepAlive: true,
-          reconnect: {
-            attempts: this.maxReconnectAttempts,
-            delay: 1000,
-          },
+        transport: webSocket(endpoint, {
+          keepAlive: { interval: 30_000 },
+          reconnect: false,
         }),
       });
 
-      // Arbitrum usa secuenciador centralizado: sin mempool tradicional.
-      // watchBlocks con includeTransactions es más confiable (~250ms por bloque).
       this.client.watchBlocks({
         includeTransactions: true,
         onBlock: async (block) => {
@@ -87,16 +106,22 @@ export class WebSocketMonitor {
           await this.processBlockTransactions(txs);
         },
         onError: (error) => {
-          logger.error({ error }, 'WebSocket error');
-          this.handleReconnect();
+          if (errorFired) return;
+          errorFired = true;
+          const msg = error instanceof Error ? error.message : JSON.stringify(error);
+          if (msg && msg !== '{}') logger.warn(`WebSocket error: ${msg}`);
+          const ep = WS_ENDPOINTS[this.endpointIndex % WS_ENDPOINTS.length].replace('wss://', '').split('/')[0];
+          dash.emit('ws_status', { status: 'disconnected', endpoint: ep, attempt: this.reconnectAttempts });
+          this.handleReconnect().catch(() => {});
         },
       });
 
+      const ep = WS_ENDPOINTS[this.endpointIndex % WS_ENDPOINTS.length].replace('wss://', '').split('/')[0];
       logger.info('✅ WebSocket conectado — monitoreando bloques de Arbitrum');
-      this.reconnectAttempts = 0;
+      dash.emit('ws_status', { status: 'connected', endpoint: ep, attempt: this.reconnectAttempts });
 
     } catch (error) {
-      logger.error({ error }, 'Failed to connect to WebSocket');
+      logger.warn({ error }, 'WebSocket connect failed');
       await this.handleReconnect();
     } finally {
       this.isConnecting = false;
@@ -109,21 +134,23 @@ export class WebSocketMonitor {
     this.reconnectAttempts++;
 
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      logger.error('Max reconnection attempts reached, stopping monitor');
-      this.isRunning = false;
-      // Critical: notify user the WebSocket died
-      try {
-        const { TelegramBot } = await import('../services/telegram');
-        const { config } = await import('../config');
-        const t = new TelegramBot(config.telegram.botToken, config.telegram.chatId);
-        await t.start();
-        await t.send('🚨 *CRÍTICO: WebSocket desconectado*\n\nEl monitor de Arbitrum se cayó después de 10 intentos.\nReinicia el bot: `docker compose restart agent`', { parse_mode: 'Markdown' });
-      } catch (e) { logger.error(e, 'Could not send WebSocket death alert'); }
+      logger.warn('Max reconnection attempts reached — pausing 5 min then retrying');
+      this.reconnectAttempts = 0;
+      this.endpointIndex = 0;
+      await new Promise(resolve => setTimeout(resolve, 5 * 60_000));
+      await this.connect();
       return;
     }
 
-    const delay = Math.min(this.reconnectAttempts * 1000, 30000);
-    logger.warn(`Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+    // Rotate endpoint every 3 failed attempts
+    if (this.reconnectAttempts % 3 === 0) {
+      this.endpointIndex++;
+      const next = WS_ENDPOINTS[this.endpointIndex % WS_ENDPOINTS.length];
+      logger.warn(`Switching to next endpoint: ${next}`);
+    }
+    // Exponential backoff: 10s, 20s, 40s … cap at 120s
+    const delay = Math.min(10_000 * Math.pow(2, (this.reconnectAttempts % 3) - 1), 120_000);
+    logger.warn(`Reconnecting in ${Math.round(delay / 1000)}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
 
     await new Promise(resolve => setTimeout(resolve, delay));
     await this.connect();
@@ -131,6 +158,7 @@ export class WebSocketMonitor {
 
   private async processBlockTransactions(txs: Transaction[]): Promise<void> {
     if (this.paused) return;
+    this.reconnectAttempts = 0; // reset on first successful block
     await Promise.all(
       txs.map(tx => this.processTransaction(tx).catch(err => {
         logger.error({ hash: tx.hash, err }, 'Error processing tx');
@@ -159,6 +187,12 @@ export class WebSocketMonitor {
       // Filter 3: Is it a swap function?
       const swapDetails = this.decodeSwap(tx);
       if (!swapDetails) {
+        // Log unrecognized selectors for tracked wallets — helps identify missing decoders
+        const sel = tx.input?.slice(0, 10);
+        if (sel && sel.length === 10) {
+          logger.debug(`Undecodeable swap from tracked wallet ${tx.from.slice(0, 8)} sel=${sel} router=${this.getDexName(tx.to!)}`);
+          dash.emit('log', { severity: 'info', message: `⚙️ Swap sin decoder: ${tx.from.slice(0, 8)}… sel=${sel} (${this.getDexName(tx.to!)})` });
+        }
         return;
       }
 
@@ -180,8 +214,10 @@ export class WebSocketMonitor {
       const tokenIn  = swapDetails.tokenIn.toLowerCase();
       const tokenOut = swapDetails.tokenOut.toLowerCase();
 
-      const isSell = STABLE_TOKENS.has(tokenOut);
-      const isBuy  = STABLE_TOKENS.has(tokenIn) || (!STABLE_TOKENS.has(tokenIn) && !STABLE_TOKENS.has(tokenOut));
+      // Sell: altcoin → stable. Excludes stable→stable swaps (e.g. USDC→WETH = DeFi routing)
+      const isSell = STABLE_TOKENS.has(tokenOut) && !STABLE_TOKENS.has(tokenIn);
+      // Buy: anything → altcoin (stable→alt, or alt→alt rebalance)
+      const isBuy  = !STABLE_TOKENS.has(tokenOut);
 
       // Skip boring blue-chip BUY signals — not the alpha we're looking for
       if (isBuy && SKIP_BUY_TOKENS.has(tokenOut)) {
@@ -234,6 +270,7 @@ export class WebSocketMonitor {
     if (toLower === ROUTERS.sushiswap.toLowerCase())    return 'SushiSwap';
     if (toLower === ROUTERS.oneInch.toLowerCase())      return '1inch';
     if (toLower === ROUTERS.camelot.toLowerCase())      return 'Camelot';
+    if (toLower === ROUTERS.camelotV3.toLowerCase())    return 'Camelot V3';
     if (toLower === ROUTERS.paraswap.toLowerCase())     return 'Paraswap';
     if (toLower === ROUTERS.odos.toLowerCase())         return 'Odos';
     if (toLower === ROUTERS.balancer.toLowerCase())     return 'Balancer';
@@ -257,6 +294,8 @@ export class WebSocketMonitor {
         case SWAP_SELECTORS.multicall:               return this.decodeMulticall(input, txTo, value);
         case SWAP_SELECTORS.multicallWithDeadline:   return this.decodeMulticallWithDeadline(input, txTo, value);
         case SWAP_SELECTORS.oneInchSwap:             return this.decode1inchSwap(input);
+        case SWAP_SELECTORS.odosSwap:                return this.decodeOdosSwap(input);
+        case SWAP_SELECTORS.oneInchUnoswap:          return this.decode1inchUnoswap(input);
         default: return null;
       }
     } catch {
@@ -425,17 +464,35 @@ export class WebSocketMonitor {
 
       if (path.length < 2 || !value) return null;
 
-      // First token should be WETH
-      const WETH = '0x82aF49447D8a07e3bd95BD0d56f35241523fBab1'; // Arbitrum WETH
-
       return {
-        tokenIn: WETH,
+        tokenIn: WETH_ADDRESS,
         tokenOut: path[path.length - 1],
         amountIn: value,
       };
     } catch (error) {
       return null;
     }
+  }
+
+  // Odos V2 Router: swap(SwapTokenInfo memory tokenInfo, bytes calldata pathDefinition, address executor, uint32 referralCode)
+  private decodeOdosSwap(input: string): { tokenIn: string; tokenOut: string; amountIn: bigint } | null {
+    try {
+      const params = `0x${input.slice(10)}` as `0x${string}`;
+      const [tokenInfo] = decodeAbiParameters(
+        parseAbiParameters(
+          '(address inputToken, uint256 inputAmount, address inputReceiver, address outputToken, uint256 outputQuote, uint256 outputMin, address outputReceiver) tokenInfo, bytes pathDefinition, address executor, uint32 referralCode',
+        ),
+        params,
+      );
+      const info = tokenInfo as { inputToken: string; inputAmount: bigint; outputToken: string };
+      return { tokenIn: info.inputToken, tokenOut: info.outputToken, amountIn: info.inputAmount };
+    } catch { return null; }
+  }
+
+  // 1inch v5 unoswap: output token is encoded inside the pools array (complex to decode).
+  // We return null here — the "missed selector" logger above will surface these so we can add support later.
+  private decode1inchUnoswap(_input: string): { tokenIn: string; tokenOut: string; amountIn: bigint } | null {
+    return null;
   }
 
   async stop(): Promise<void> {

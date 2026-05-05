@@ -31,7 +31,7 @@ const PERF_REVIEW_INTERVAL  = 6 * 60 * 60 * 1000;
 const MIN_SWAPS_TO_TRACK    = 5;
 const MIN_SCORE_TO_ADD      = 60;
 const MAX_WALLETS_TO_ADD    = 3;
-const MAX_TRACKED_WALLETS   = 20;
+const MAX_TRACKED_WALLETS   = 50;
 const OBSERVE_DEBOUNCE_MS   = 5 * 60 * 1000;
 const RETIRE_SCORE_THRESHOLD = 38;
 const MIN_TRADES_FOR_PERF    = 3;
@@ -508,6 +508,14 @@ export class WalletDiscoveryService {
     const lastSeen = this.recentlyObserved.get(key);
     if (lastSeen && Date.now() - lastSeen < OBSERVE_DEBOUNCE_MS) return;
     this.recentlyObserved.set(key, Date.now());
+
+    // Evict stale debounce entries to prevent unbounded growth
+    if (this.recentlyObserved.size > 500) {
+      const cutoff = Date.now() - OBSERVE_DEBOUNCE_MS;
+      for (const [k, ts] of this.recentlyObserved) {
+        if (ts < cutoff) this.recentlyObserved.delete(k);
+      }
+    }
     try {
       await this.db.query(
         `INSERT INTO wallet_observations (address, swap_count, last_seen) VALUES ($1, 1, NOW())

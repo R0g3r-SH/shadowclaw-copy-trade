@@ -1,7 +1,7 @@
 import { useEffect, useRef, useCallback } from 'react'
 
 export type SSEEvent = {
-  type: 'block' | 'signal' | 'trade' | 'tokens' | 'log' | 'status'
+  type: 'block' | 'signal' | 'trade' | 'tokens' | 'log' | 'status' | 'ws_status'
   data: unknown
 }
 
@@ -30,7 +30,7 @@ export function useSSE(
       setTimeout(connect, 3000)
     }
 
-    const events: SSEEvent['type'][] = ['block', 'signal', 'trade', 'tokens', 'log', 'status']
+    const events: SSEEvent['type'][] = ['block', 'signal', 'trade', 'tokens', 'log', 'status', 'ws_status']
     events.forEach(type => {
       es.addEventListener(type, (e: MessageEvent) => {
         try {

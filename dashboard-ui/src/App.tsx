@@ -1,6 +1,6 @@
 import { useReducer, useCallback, useRef } from 'react'
 import { useSSE } from './hooks/useSSE'
-import { useStatus, usePortfolio, useWallets, useTrades, useBotToggle } from './hooks/useAPI'
+import { useStatus, usePortfolio, useWallets, useTrades, useBotToggle, useLivePositions } from './hooks/useAPI'
 import { Header } from './components/Header'
 import { Panel } from './components/Panel'
 import { KPIBar } from './components/KPIBar'
@@ -10,8 +10,9 @@ import { BlocksChart } from './components/BlocksChart'
 import { SignalsChart } from './components/SignalsChart'
 import { WalletsPanel } from './components/WalletsPanel'
 import { TradesPanel } from './components/TradesPanel'
+import { PositionsPanel } from './components/PositionsPanel'
 import { Feed } from './components/Feed'
-import type { DashState, FeedItem } from './types'
+import type { DashState, FeedItem, WsStatus } from './types'
 
 const MAX_FEED = 80
 
@@ -28,7 +29,7 @@ function feedReducer(state: FeedState, action: FeedAction): FeedState {
 
 const initState: DashState = {
   blk: 0, sig: 0, trd: 0, inTok: 0, outTok: 0, calls: 0,
-  buyC: 0, sellC: 0, connected: false, tradeReload: 0,
+  buyC: 0, sellC: 0, connected: false, tradeReload: 0, wsStatus: null,
 }
 
 function now() { return new Date().toLocaleTimeString('es-MX', { hour12: false }) }
@@ -102,6 +103,10 @@ export default function App() {
         addFeed('log', cls, d.message as string)
         break
       }
+
+      case 'ws_status':
+        set({ wsStatus: e.data as WsStatus })
+        break
     }
   }, [addFeed])
 
@@ -112,6 +117,7 @@ export default function App() {
   const { data: portfolio }  = usePortfolio()
   const wallets = useWallets()
   const trades  = useTrades(sRef.current.tradeReload)
+  const { positions } = useLivePositions(30000)
   const s = sRef.current
 
   return (
@@ -125,7 +131,7 @@ export default function App() {
 
       {/* ROW 1: Sistema | Live Feed | Claude AI */}
       <div className="grid gap-1.5" style={{ gridTemplateColumns: '190px 1fr 215px', flexShrink: 0, height: 195 }}>
-        <SystemPanel data={statusData} />
+        <SystemPanel data={statusData} wsStatus={s.wsStatus} />
         <Panel className="p-3">
           <div className="sec" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
             <span>◈ Live Feed</span>
@@ -145,8 +151,9 @@ export default function App() {
         <WalletsPanel wallets={wallets} />
       </div>
 
-      {/* ROW 3: Trades | Logs */}
-      <div className="grid grid-cols-2 gap-1.5 flex-1 min-h-0">
+      {/* ROW 3: Posiciones live | Trades | Logs */}
+      <div className="grid gap-1.5 flex-1 min-h-0" style={{ gridTemplateColumns: '1fr 1fr 1fr' }}>
+        <PositionsPanel positions={positions} />
         <TradesPanel trades={trades} />
         <Panel className="p-3">
           <div className="sec">◈ System Logs</div>

@@ -4,19 +4,32 @@ import { callClaude, type Message, type ContentBlock } from '../utils/claude-cli
 import { dash } from '../dashboard/events';
 import { tools } from './tools';
 import { getTokenMarketData, getEthPriceUsd } from '../utils/dexscreener';
-import { createPublicClient, http, formatEther } from 'viem';
+import { createPublicClient, http, formatEther, formatUnits } from 'viem';
 import { arbitrum } from 'viem/chains';
+import { USDC_ADDRESS, ERC20_BALANCE_ABI, usdToUsdc } from '../constants/tokens';
 import type { DatabaseService } from '../services/database';
 import type { TokenSafetyChecker } from '../safety/token-safety';
+import type { SafetyResult } from '../safety/token-safety';
 import type { TradeExecutor } from '../execution/trade-executor';
+import type { ConvergenceResult } from '../services/convergence-tracker';
+
+function pairAgeMinutes(pairCreatedAt: number | null | undefined): number | null {
+  return pairCreatedAt ? Math.floor((Date.now() - pairCreatedAt) / 60_000) : null;
+}
+
+function fmtPct(value: number | null | undefined): string {
+  return value != null ? `${value > 0 ? '+' : ''}${value.toFixed(2)}%` : 'unavailable';
+}
 
 export interface TradeContext {
   walletAddress: string;
   walletScore: number;
   tokenAddress: string;
-  maxAmountUsd: number;   // orchestrator passes the max safe position
+  maxAmountUsd: number;
   originalTxHash: string;
-  tokenIn: string;        // needed for execute_trade
+  tokenIn: string;
+  safetyResult?: SafetyResult;
+  convergence?: ConvergenceResult;
 }
 
 export interface AgentDecision {
@@ -31,8 +44,9 @@ export interface AgentDecision {
 export class AgentService {
   private publicClient = createPublicClient({
     chain: arbitrum,
-    transport: http(`https://arb-mainnet.g.alchemy.com/v2/${config.blockchain.alchemy.apiKey}`),
+    transport: http(config.blockchain.alchemy.httpRpcUrl),
   });
+  private _runMarketCache: { tokenAddress: string; data: Awaited<ReturnType<typeof getTokenMarketData>> } | null = null;
 
   constructor(
     private db: DatabaseService,
@@ -150,65 +164,172 @@ export class AgentService {
       reasoning = 'Agent loop ended without decision';
     }
 
+    this._runMarketCache = null;
     return { executedTrade, requestsApproval, skipped, reasoning, confidence, suggestedAmountUsd };
   }
 
   private buildSystemPrompt(mode: 'claude-code' | 'hybrid' | 'openclaw'): string {
-    const base = `You are a crypto copy trading agent on Arbitrum. A tracked wallet just made a trade.
-Your job: analyze the trade opportunity and make a decision using the available tools.
+    const base = `You are a crypto copy trading agent on Arbitrum. A tracked smart-money wallet just made a swap.
+The initial analysis (safety check + market snapshot) is already included in the trade brief.
+Use tools only when you need data not already provided.
 
-Workflow:
-1. Call check_token_safety to assess the token
-2. Call get_wallet_history to understand the wallet's track record
-3. Call get_dex_metrics to check liquidity and market conditions
-4. Call get_portfolio_status to know available capital and current exposure
-5. Make your decision using ONE of: execute_trade, request_approval, or skip_trade
+## HARD SKIP RULES — skip immediately, no further analysis needed:
+- is_honeypot: true
+- risk_score >= 70
+- liquidity_usd < 25000
+- is_blacklisted: true
+- Token age < 30 minutes AND liquidity < $100k (very new with low liquidity = rug risk)
 
-NEVER end without calling execute_trade, request_approval, or skip_trade.
-Be concise in your reasoning — focus on what matters most for the decision.`;
+## POSITION SIZING FORMULA:
+base_amount = max_safe_position_usd
+score_factor = wallet_score / 100           (higher trust → bigger size)
+safety_factor = 1 - (risk_score / 150)     (higher risk → smaller size)
+suggested_amount = base_amount × score_factor × safety_factor
+
+Examples:
+- wallet_score=90, risk=20 → 90% × 87% = ~78% of max
+- wallet_score=70, risk=40 → 70% × 73% = ~51% of max
+- wallet_score=50, risk=60 → 50% × 60% = ~30% of max
+Minimum: $0.50 or 1% of USDC balance (whichever is higher). Never exceed max_safe_position_usd.
+
+## SLIPPAGE — always use the recommended value from the brief, do not change it:
+The recommended slippage is already calculated based on risk_score.
+
+## DECISION GUIDE:
+execute_trade → risk_score < 50 AND liquidity > $100k AND wallet_score >= 70 AND price_change_h1 > 0
+request_approval → interesting trade but uncertain (new wallet with no history, moderate risk, large amount)
+skip_trade → hard skip rules triggered OR risk too high OR liquidity too low OR already pumped >50% in 1h
+
+## WORKFLOW (minimum tool calls):
+1. If safety data in the brief is sufficient → skip check_token_safety
+2. Always call get_wallet_history to verify actual copy performance
+3. Call get_dex_metrics only if market snapshot in brief is missing or stale
+4. Call get_portfolio_status only if you need to check position count
+5. Decide with execute_trade / request_approval / skip_trade
+
+NEVER end without calling one of the three decision tools.
+Be concise — one sentence per key factor in your reasoning.`;
 
     const modes: Record<string, string> = {
-      'claude-code': `\nMODE: Analysis-only. Always use request_approval. Never execute_trade directly.`,
-      'hybrid':      `\nMODE: Use your judgment. Auto-execute if you are highly confident and the trade is safe. Request approval if you want human input. Skip if the trade is not worth it.`,
-      'openclaw':    `\nMODE: Full autonomy. Execute if you think it's a good trade. Only request_approval for very large or unusual trades. Bias toward action.`,
+      'claude-code': `\n\n## MODE: claude-code
+Always use request_approval. Never execute_trade. Your role is analysis only.`,
+
+      'hybrid': `\n\n## MODE: hybrid
+Auto-execute when: risk_score < 40 AND wallet_score >= 75 AND liquidity > $100k AND price_change_h1 < 30%
+Request approval when: risk_score 40-60 OR wallet_score 60-75 OR price already up 20-50% in 1h
+Skip when: hard rules hit OR risk > 60 OR liquidity < $25k`,
+
+      'openclaw': `\n\n## MODE: openclaw (full autonomy)
+Bias strongly toward action. Execute unless a hard skip rule fires.
+Request approval only for positions > 80% of max_safe_position_usd or risk_score > 55.
+Skip only on hard rules or obvious rugs.`,
     };
 
     return base + modes[mode];
   }
 
   private async buildUserPrompt(context: TradeContext): Promise<string> {
-    const ethPrice = await getEthPriceUsd().catch(() => 2000);
-    const balanceWei = await this.publicClient.getBalance({ address: config.wallet.address as `0x${string}` }).catch(() => 0n);
+    const [ethPrice, balanceWei, usdcRaw, marketData] = await Promise.all([
+      getEthPriceUsd().catch(() => 2000),
+      this.publicClient.getBalance({ address: config.wallet.address as `0x${string}` }).catch(() => 0n),
+      this.publicClient.readContract({ address: USDC_ADDRESS, abi: ERC20_BALANCE_ABI, functionName: 'balanceOf', args: [config.wallet.address as `0x${string}`] }).catch(() => 0n),
+      getTokenMarketData(context.tokenAddress).catch(() => null),
+    ]);
+
+    this._runMarketCache = { tokenAddress: context.tokenAddress.toLowerCase(), data: marketData };
+
     const ethBalance = parseFloat(formatEther(BigInt(balanceWei))).toFixed(4);
-    const usdBalance = (parseFloat(ethBalance) * ethPrice).toFixed(2);
+    const ethUsd     = parseFloat(ethBalance) * ethPrice;
+    const usdcBalance = parseFloat(formatUnits(BigInt(usdcRaw as bigint), 6));
+    const totalUsd   = (ethUsd + usdcBalance).toFixed(2);
+    const usdBalance = ethUsd.toFixed(2);
 
-    return `Wallet ${context.walletAddress} (trust score: ${context.walletScore}/100) just bought token ${context.tokenAddress}.
+    const sr = context.safetyResult;
+    const safetySection = sr
+      ? `## Safety (pre-computed — skip check_token_safety unless you need more detail)
+risk_score: ${sr.riskScore}/100
+is_honeypot: ${sr.isHoneypot}
+is_mintable: ${sr.isMintable}
+is_blacklisted: ${sr.isBlacklisted}
+is_verified: ${sr.isVerified}
+liquidity_usd: $${sr.liquidityUsd.toLocaleString()}
+flags: ${sr.reasons.length > 0 ? sr.reasons.join(', ') : 'none'}`
+      : `## Safety: not pre-computed — call check_token_safety`;
 
+    const mkt = marketData;
+    const age = pairAgeMinutes(mkt?.pairCreatedAt);
+    const marketSection = mkt
+      ? `## Market snapshot (pre-computed — skip get_dex_metrics unless stale)
+price_usd: $${mkt.priceUsd}
+liquidity_usd: $${mkt.liquidityUsd.toLocaleString()}
+volume_24h_usd: $${mkt.volume24h.toLocaleString()}
+price_change_h1: ${fmtPct(mkt.priceChangeH1)}
+price_change_h24: ${fmtPct(mkt.priceChangeH24)}
+fdv_usd: ${mkt.fdv ? `$${mkt.fdv.toLocaleString()}` : 'unavailable'}
+pair_age_minutes: ${age ?? 'unavailable'}`
+      : `## Market snapshot: unavailable — call get_dex_metrics`;
+
+    // Recommended slippage based on risk score (so agent uses correct value)
+    const riskScore = sr?.riskScore ?? 50;
+    const recommendedSlippage = this.tradeExecutor.calculateSlippage(context.tokenAddress, riskScore);
+
+    const conv = context.convergence;
+    const convergenceSection = conv && conv.isConverging
+      ? `## ⚡ CONVERGENCE SIGNAL (${conv.count} wallets)
+${conv.count} tracked smart-money wallets bought this token in the last 5 minutes:
+${conv.wallets.map(w => `  - ${w.walletAddress.slice(0, 10)}... (score: ${w.walletScore})`).join('\n')}
+Average wallet score: ${conv.avgWalletScore}/100
+Position size already boosted to ${conv.isStrong ? '2×' : '1.5×'} base (max: $${context.maxAmountUsd.toFixed(2)}).
+STRONG SIGNAL: Bias heavily toward execute_trade unless a hard skip rule fires.`
+      : '';
+
+    return `## Trade brief
+
+Wallet: ${context.walletAddress}
+Wallet trust score: ${context.walletScore}/100
+Token bought: ${context.tokenAddress}
 Original TX: ${context.originalTxHash}
-Bot wallet balance: ${ethBalance} ETH (~$${usdBalance} USD)
-Max safe position: $${context.maxAmountUsd.toFixed(2)} USD
+${convergenceSection ? `\n${convergenceSection}\n` : ''}
+## Bot portfolio
+ETH balance: ${ethBalance} ETH (~$${usdBalance} USD) — para gas únicamente
+USDC balance: $${usdcBalance.toFixed(2)} USDC — capital de trading
+Total portfolio: $${totalUsd} USD
+Max safe position: $${context.maxAmountUsd.toFixed(2)} USD (2% del USDC disponible)
+Recommended slippage: ${recommendedSlippage}% (based on risk score — use this value)
 
-Analyze and decide.`;
+${safetySection}
+
+${marketSection}
+
+## Next step
+1. Call get_wallet_history for ${context.walletAddress}
+2. Apply position sizing formula from your instructions
+3. Decide: execute_trade / request_approval / skip_trade`;
   }
 
   private async handleExecuteTrade(input: any, context: TradeContext): Promise<any> {
     try {
       const ethPrice = await getEthPriceUsd();
-      const amountIn = BigInt(Math.floor((input.amount_usd / ethPrice) * 1e18));
+      const amountIn = usdToUsdc(input.amount_usd);
+
+      // Slippage is always derived from the safety risk score, not agent-supplied value —
+      // prevents the agent from accepting excessive slippage on high-risk tokens.
+      const riskScore = context.safetyResult?.riskScore ?? 50;
+      const slippage = this.tradeExecutor.calculateSlippage(context.tokenAddress, riskScore);
 
       const result = await this.tradeExecutor.executeTrade({
-        tokenIn: input.token_in || context.tokenIn,
+        tokenIn: USDC_ADDRESS,
         tokenOut: input.token_out || context.tokenAddress,
         amountIn,
         amountUsd: input.amount_usd,
-        slippagePct: input.slippage_pct || 1,
+        slippagePct: slippage,
       });
 
       if (result.success && result.txHash) {
         const tradeId = await this.db.saveCopiedTrade({
           originalTxHash: context.originalTxHash,
           walletAddress: context.walletAddress,
-          tokenIn: input.token_in || context.tokenIn,
+          tokenIn: USDC_ADDRESS,
           tokenOut: input.token_out || context.tokenAddress,
           amountIn: amountIn.toString(),
           positionSizeUsd: input.amount_usd,
@@ -232,49 +353,76 @@ Analyze and decide.`;
     try {
       switch (name) {
         case 'check_token_safety': {
-          const result = await this.tokenSafety.checkToken(input.token_address);
+          // Use pre-computed result if the agent is asking about the same token
+          const precomputed = context.safetyResult &&
+            input.token_address?.toLowerCase() === context.tokenAddress.toLowerCase()
+            ? context.safetyResult
+            : await this.tokenSafety.checkToken(input.token_address);
           return {
-            is_honeypot: result.isHoneypot,
-            is_mintable: result.isMintable,
-            is_blacklisted: result.isBlacklisted,
-            is_verified: result.isVerified,
-            liquidity_usd: result.liquidityUsd,
-            risk_score: result.riskScore,
-            flags: result.reasons,
+            is_honeypot: precomputed.isHoneypot,
+            is_mintable: precomputed.isMintable,
+            is_blacklisted: precomputed.isBlacklisted,
+            is_verified: precomputed.isVerified,
+            liquidity_usd: precomputed.liquidityUsd,
+            risk_score: precomputed.riskScore,
+            flags: precomputed.reasons,
           };
         }
         case 'get_wallet_history': {
-          const result = await this.db.query(
-            `SELECT token_in, token_out, dex, timestamp FROM tracked_transactions WHERE wallet_address = $1 ORDER BY timestamp DESC LIMIT $2`,
-            [input.wallet_address, input.limit || 20]
-          );
-          const wins = await this.db.query(
-            `SELECT COUNT(*) as total, COUNT(CASE WHEN pnl > 0 THEN 1 END) as wins FROM copied_trades WHERE wallet_address = $1`,
-            [input.wallet_address]
-          );
-          const w = wins.rows[0];
+          const [recent, counts, perf] = await Promise.all([
+            this.db.query(
+              `SELECT token_in, token_out, dex, timestamp FROM tracked_transactions WHERE wallet_address = $1 ORDER BY timestamp DESC LIMIT $2`,
+              [input.wallet_address, input.limit || 20]
+            ),
+            // Real total — not capped by query limit
+            this.db.query(
+              `SELECT COUNT(*) as total FROM tracked_transactions WHERE wallet_address = $1`,
+              [input.wallet_address]
+            ),
+            // Win rate over CLOSED copies only (open trades have pnl=0, skews result)
+            this.db.query(
+              `SELECT COUNT(*) as total, COUNT(CASE WHEN pnl > 0 THEN 1 END) as wins,
+                      ROUND(AVG(pnl_pct)*100, 1) as avg_pnl_pct
+               FROM copied_trades WHERE wallet_address = $1 AND status = 'closed'`,
+              [input.wallet_address]
+            ),
+          ]);
+          const w = perf.rows[0];
           return {
-            total_tracked_txs: result.rows.length,
-            win_rate: w.total > 0 ? `${Math.round((w.wins / w.total) * 100)}%` : 'no copies yet',
-            recent_trades: result.rows.slice(0, 10),
+            total_tracked_txs: parseInt(counts.rows[0].total),
+            copies_closed: parseInt(w.total),
+            win_rate: w.total > 0 ? `${Math.round((w.wins / w.total) * 100)}%` : 'no closed copies yet',
+            avg_pnl_pct: w.total > 0 ? `${w.avg_pnl_pct}%` : 'n/a',
+            recent_trades: recent.rows.slice(0, 10),
           };
         }
         case 'get_dex_metrics': {
-          const mkt = await getTokenMarketData(input.token_address);
+          const cached = this._runMarketCache !== null &&
+            this._runMarketCache.tokenAddress === input.token_address?.toLowerCase()
+            ? this._runMarketCache.data
+            : null;
+          const mkt = cached ?? await getTokenMarketData(input.token_address);
           if (!mkt) return { error: 'DEXScreener data unavailable' };
           return {
-            liquidity_usd: mkt.liquidityUsd,
-            volume_24h_usd: mkt.volume24h,
-            price_usd: mkt.priceUsd,
+            price_usd:        mkt.priceUsd,
+            liquidity_usd:    mkt.liquidityUsd,
+            volume_24h_usd:   mkt.volume24h,
+            price_change_h1:  fmtPct(mkt.priceChangeH1),
+            price_change_h24: fmtPct(mkt.priceChangeH24),
+            fdv_usd:          mkt.fdv ?? 'unavailable',
+            pair_age_minutes: pairAgeMinutes(mkt.pairCreatedAt) ?? 'unavailable',
           };
         }
         case 'get_portfolio_status': {
           const open = await this.db.getOpenPositions();
           const pnl = await this.db.getDailyPnL();
           const ethPrice = await getEthPriceUsd();
-          const publicClient = createPublicClient({ chain: arbitrum, transport: http(`https://arb-mainnet.g.alchemy.com/v2/${config.blockchain.alchemy.apiKey}`) });
-          const balanceWei = await publicClient.getBalance({ address: config.wallet.address as `0x${string}` }).catch(() => 0n);
+          const [balanceWei, usdcRaw] = await Promise.all([
+            this.publicClient.getBalance({ address: config.wallet.address as `0x${string}` }).catch(() => 0n),
+            this.publicClient.readContract({ address: USDC_ADDRESS, abi: ERC20_BALANCE_ABI, functionName: 'balanceOf', args: [config.wallet.address as `0x${string}`] }).catch(() => 0n),
+          ]);
           const ethBalance = parseFloat(formatEther(BigInt(balanceWei)));
+          const usdcBalance = parseFloat(formatUnits(BigInt(usdcRaw as bigint), 6));
           return {
             open_positions: open,
             max_positions: config.trading.maxPositions,
@@ -282,6 +430,8 @@ Analyze and decide.`;
             daily_pnl_usd: pnl.toFixed(2),
             eth_balance: ethBalance.toFixed(4),
             eth_balance_usd: (ethBalance * ethPrice).toFixed(2),
+            usdc_balance: usdcBalance.toFixed(2),
+            total_portfolio_usd: (ethBalance * ethPrice + usdcBalance).toFixed(2),
             max_safe_position_usd: context.maxAmountUsd.toFixed(2),
           };
         }

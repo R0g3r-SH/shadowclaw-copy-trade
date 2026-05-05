@@ -2,7 +2,7 @@ import { callClaude, type Message, type Tool } from '../utils/claude-client';
 import { DatabaseService } from '../services/database';
 import { WalletDiscoveryService } from '../discovery/wallet-discovery';
 
-const MAX_TRACKED_WALLETS = 20;
+const MAX_TRACKED_WALLETS = 50;
 
 const DECIDE_TOOL: Tool = {
   name: 'discovery_decision',
@@ -83,14 +83,14 @@ Responde en español, conciso, con emojis.`,
           const wr = w.totalTrades > 0 ? `wr:${(w.winRate * 100).toFixed(0)}%` : 'sin trades';
           const pnl = w.totalTrades > 0 ? ` pnl:$${w.totalPnl.toFixed(1)}` : '';
           const src = w.label?.startsWith('Auto:') ? '(arbiscan)' : w.label === 'Organic' ? '(orgánica)' : w.label?.startsWith('SmartMoney') ? '(smart-money)' : '(manual)';
-          return `• ${w.address.slice(0,14)}… score:${w.score} ${wr}${pnl} ${src} trades:${w.totalTrades}`;
+          return `• ${w.address} score:${w.score} ${wr}${pnl} ${src} trades:${w.totalTrades}`;
         }).join('\n')
       : '(ninguna aún)';
 
     const candidatesText = candidates.length > 0
       ? candidates.map(c => {
           const recency = c.lastTxAt ? `últimoSwap:${Math.round((Date.now() / 1000 - c.lastTxAt) / 3600)}h` : '';
-          return `• ${c.address.slice(0,14)}… score:${c.score} swaps:${c.swapCount} DEXes:${c.routers.join('+')} ${recency} [${c.source}]`;
+          return `• ${c.address} score:${c.score} swaps:${c.swapCount} DEXes:${c.routers.join('+')} ${recency} [${c.source}]`;
         }).join('\n')
       : '(ninguna candidata esta ronda)';
 

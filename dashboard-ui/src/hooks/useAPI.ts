@@ -22,6 +22,21 @@ export type PortfolioData = {
 export type WalletRow = { address: string; label: string; score: number }
 export type TradeRow  = { token_out: string; position_size_usd: string; pnl: string; status: string; created_at: string }
 
+export type LivePosition = {
+  id: number
+  token: string
+  wallet: string
+  entry_usd: string
+  current_usd: string
+  pnl_usd: string
+  pnl_pct: string
+  price_change_h1: string
+  trailing_stop: string
+  sl_at: string
+  tp_at: string
+  open_since: string
+}
+
 function useFetch<T>(url: string, initial: T, refreshMs: number) {
   const [data, setData] = useState<T>(initial)
   const load = useCallback(async () => {
@@ -81,4 +96,13 @@ export function useTrades(trigger: number) {
     fetch('/api/trades').then(r => r.json()).then(d => setTrades(d.trades ?? [])).catch(() => {})
   }, [trigger])
   return trades
+}
+
+export function useLivePositions(refreshMs = 30000) {
+  const [positions, setPositions] = useState<LivePosition[]>([])
+  const load = useCallback(async () => {
+    try { setPositions((await (await fetch('/api/positions/live')).json()).positions ?? []) } catch { /* ignore */ }
+  }, [])
+  useEffect(() => { load(); const id = setInterval(load, refreshMs); return () => clearInterval(id) }, [load, refreshMs])
+  return { positions, reload: load }
 }

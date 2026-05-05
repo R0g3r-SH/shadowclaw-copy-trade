@@ -5,6 +5,7 @@ import { DatabaseService } from '../services/database';
 import { AgentService } from '../agent/agent-service';
 import { dash } from '../dashboard/events';
 import type { SafetyResult } from '../safety/token-safety';
+import type { ConvergenceResult } from '../services/convergence-tracker';
 
 export interface DecisionContext {
   walletAddress: string;
@@ -14,6 +15,7 @@ export interface DecisionContext {
   maxAmountUsd: number;
   safetyResult: SafetyResult;
   originalTxHash: string;
+  convergence?: ConvergenceResult;
 }
 
 export interface Decision {
@@ -50,6 +52,8 @@ export class HybridDecisionEngine {
         tokenIn: context.tokenIn,
         maxAmountUsd: context.maxAmountUsd,
         originalTxHash: context.originalTxHash,
+        safetyResult: context.safetyResult,
+        convergence: context.convergence,
       },
       mode
     );
@@ -129,10 +133,20 @@ export class HybridDecisionEngine {
 
       dash.emit('log', { severity: 'warning', message: `⏳ Esperando aprobación · $${agentDecision.suggestedAmountUsd.toFixed(2)} · conf: ${conf}%` });
 
-      const approved = await this.telegram.requestApproval(message, config.telegram.approvalTimeout);
+      const result = await this.telegram.requestApproval(
+        message,
+        config.telegram.approvalTimeout,
+        () => { // onTimeout callback
+          this.db.updateApprovalRequest(requestId, 'expired').catch(() => {});
+          dash.emit('log', { severity: 'warning', message: `⏰ Aprobación expirada — trade cancelado` });
+        },
+      );
 
-      await this.db.updateApprovalRequest(requestId, approved ? 'approved' : 'rejected');
-      dash.emit('log', { severity: approved ? 'trade' : 'info', message: `${approved ? '✅ Aprobado' : '❌ Rechazado'} por usuario` });
+      const { approved, timedOut } = result;
+      if (!timedOut) {
+        await this.db.updateApprovalRequest(requestId, approved ? 'approved' : 'rejected');
+        dash.emit('log', { severity: approved ? 'trade' : 'info', message: approved ? '✅ Aprobado por usuario — ejecutando' : '❌ Rechazado por usuario' });
+      }
 
       return approved;
     } catch (error) {

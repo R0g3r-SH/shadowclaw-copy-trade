@@ -3,7 +3,7 @@ import Anthropic from '@anthropic-ai/sdk';
 export const tools: Anthropic.Tool[] = [
   {
     name: 'check_token_safety',
-    description: 'Check token security via GoPlus: honeypot, mintable, blacklist, taxes, liquidity. Always call this first.',
+    description: 'Check token security via GoPlus: honeypot, mintable, blacklist, taxes, liquidity. Skip if safety data is already in the trade brief.',
     input_schema: {
       type: 'object',
       properties: {
@@ -26,7 +26,7 @@ export const tools: Anthropic.Tool[] = [
   },
   {
     name: 'get_dex_metrics',
-    description: 'Get real-time DEX market data for a token: liquidity, 24h volume, price, price change.',
+    description: 'Get real-time DEX market data: price, liquidity, 24h volume, 1h/24h price change %, FDV, and pair age in minutes. Call only if market snapshot in the brief is missing.',
     input_schema: {
       type: 'object',
       properties: {
@@ -37,7 +37,7 @@ export const tools: Anthropic.Tool[] = [
   },
   {
     name: 'get_portfolio_status',
-    description: 'Get current bot portfolio: open positions, daily P&L, available ETH balance, max safe position size.',
+    description: 'Get current bot portfolio: open positions, daily P&L, USDC balance (trading capital), ETH balance (gas only), max safe position size.',
     input_schema: {
       type: 'object',
       properties: {},

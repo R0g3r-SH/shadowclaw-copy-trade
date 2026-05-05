@@ -36,7 +36,7 @@ export interface ClaudeResponse {
   usage?: { input_tokens: number; output_tokens: number };
 }
 
-const URL = 'https://your-resource.services.ai.azure.com/anthropic/v1/messages';
+const AZURE_URL = config.apis.azure.foundryEndpoint;
 const API_KEY = config.apis.azure.apiKey;
 
 export async function callClaude(params: {
@@ -61,7 +61,7 @@ export async function callClaude(params: {
 
   let response: Response;
   try {
-    response = await fetch(URL, {
+    response = await fetch(AZURE_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

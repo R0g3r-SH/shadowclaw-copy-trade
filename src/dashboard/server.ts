@@ -9,9 +9,10 @@ import { DatabaseService } from '../services/database';
 import { RedisService } from '../services/redis';
 import { config } from '../config';
 import { logger } from '../utils/logger';
+import type { PortfolioAgent } from '../agents/portfolio-agent';
 
 const DIST = path_mod.resolve(__dirname, '../../dist/dashboard');
-const ALCHEMY_RPC = `https://arb-mainnet.g.alchemy.com/v2/${config.blockchain.alchemy.apiKey}`;
+const HTTP_RPC = process.env.ARBITRUM_HTTP_RPC || 'https://arbitrum.publicnode.com';
 const USDC_ARB = '0xaf88d065e77c8cC2239327C5EDb3A432268e5831' as const;
 const ERC20_ABI = [{
   name: 'balanceOf', type: 'function' as const,
@@ -20,7 +21,7 @@ const ERC20_ABI = [{
   stateMutability: 'view' as const,
 }];
 
-const publicClient = createPublicClient({ chain: arbitrum, transport: viemHttp(ALCHEMY_RPC) });
+const publicClient = createPublicClient({ chain: arbitrum, transport: viemHttp(HTTP_RPC) });
 const walletAddress = privateKeyToAccount(config.wallet.privateKey as `0x${string}`).address;
 
 const MIME: Record<string, string> = {
@@ -44,9 +45,10 @@ function serveStatic(res: http.ServerResponse, filePath: string): boolean {
   return true;
 }
 
-type SSEClient = { res: http.ServerResponse; id: number };
-type BotControl = { pause: () => void; resume: () => void };
+type SSEClient   = { res: http.ServerResponse; id: number };
+type BotControl  = { pause: () => void; resume: () => void };
 type DiscoveryInfo = { getScheduleInfo: () => Record<string, string | number> };
+type WsStatus    = { status: 'connected' | 'disconnected' | 'connecting'; endpoint: string; attempt: number };
 
 export class DashboardServer {
   private clients = new Set<SSEClient>();
@@ -55,12 +57,15 @@ export class DashboardServer {
   private botPaused = false;
   private botControl: BotControl | null = null;
   private discoveryInfo: DiscoveryInfo | null = null;
+  private portfolioAgent: PortfolioAgent | null = null;
+  private lastWsStatus: WsStatus | null = null;
 
   constructor(private db: DatabaseService, private redis: RedisService) {
     this.bindDashEvents();
   }
 
   setDiscoveryInfo(info: DiscoveryInfo): void { this.discoveryInfo = info; }
+  setPortfolioAgent(agent: PortfolioAgent): void { this.portfolioAgent = agent; }
 
   setBotControls(control: BotControl): void {
     this.botControl = control;
@@ -78,12 +83,13 @@ export class DashboardServer {
   }
 
   private bindDashEvents(): void {
-    dash.on('block',   d => this.broadcast('block',   d));
-    dash.on('signal',  d => this.broadcast('signal',  d));
-    dash.on('trade',   d => this.broadcast('trade',   d));
-    dash.on('tokens',  d => this.broadcast('tokens',  d));
-    dash.on('log',     d => this.broadcast('log',     d));
-    dash.on('status',  d => this.broadcast('status',  d));
+    dash.on('block',     d => this.broadcast('block',     d));
+    dash.on('signal',   d => this.broadcast('signal',   d));
+    dash.on('trade',    d => this.broadcast('trade',    d));
+    dash.on('tokens',   d => this.broadcast('tokens',   d));
+    dash.on('log',      d => this.broadcast('log',      d));
+    dash.on('status',   d => this.broadcast('status',   d));
+    dash.on('ws_status', d => { this.lastWsStatus = d as WsStatus; this.broadcast('ws_status', d); });
   }
 
   private broadcast(event: string, data: unknown): void {
@@ -111,6 +117,7 @@ export class DashboardServer {
       const client: SSEClient = { res, id: ++this.clientId };
       this.clients.add(client);
       this.sendCurrentStatus(res);
+      if (this.lastWsStatus) res.write(`event: ws_status\ndata: ${JSON.stringify(this.lastWsStatus)}\n\n`);
       req.on('close', () => this.clients.delete(client));
       return;
     }
@@ -168,6 +175,7 @@ export class DashboardServer {
               COALESCE(SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END), 0)        AS gross_profit,
               COALESCE(ABS(SUM(CASE WHEN pnl < 0 THEN pnl ELSE 0 END)), 0)   AS gross_loss
             FROM copied_trades
+            WHERE status = 'closed'
           `),
         ]);
 
@@ -208,7 +216,7 @@ export class DashboardServer {
     if (urlPath === '/api/trades') {
       try {
         const r = await this.db.query(
-          `SELECT token_out, position_size_usd, pnl, status, created_at FROM copied_trades ORDER BY created_at DESC LIMIT 20`
+          `SELECT token_out, position_size_usd, pnl, status, created_at FROM copied_trades WHERE status IN ('filled','closed','closing') ORDER BY created_at DESC LIMIT 20`
         );
         this.json(res, { trades: r.rows });
       } catch { this.json(res, { trades: [] }); }
@@ -244,6 +252,16 @@ export class DashboardServer {
           pending_promotion:   parseInt(smartMoney.rows[0].pending),
         });
       } catch (e) { this.json(res, { error: String(e) }); }
+      return;
+    }
+
+    if (urlPath === '/api/positions/live') {
+      try {
+        const positions = this.portfolioAgent
+          ? await this.portfolioAgent.getLivePositions()
+          : [];
+        this.json(res, { positions });
+      } catch (e) { this.json(res, { positions: [], error: String(e) }); }
       return;
     }
 
@@ -283,18 +301,44 @@ export class DashboardServer {
 
   private async sendCurrentStatus(res: http.ServerResponse): Promise<void> {
     try {
-      const [open, daily, wallets, cb] = await Promise.all([
+      const [open, daily, wallets, cb, recentEvents, recentTrades] = await Promise.all([
         this.db.getOpenPositions(),
         this.db.getDailyPnL(),
         this.db.query(`SELECT COUNT(*) as c FROM wallets WHERE status IN ('active','monitoring')`),
         this.redis.isCircuitBreakerTriggered(),
+        this.db.query(`
+          SELECT event_type, severity, message, created_at
+          FROM system_events
+          WHERE created_at >= NOW() - INTERVAL '10 minutes'
+          ORDER BY created_at DESC LIMIT 20
+        `),
+        this.db.query(`
+          SELECT token_out, position_size_usd, status, created_at
+          FROM copied_trades
+          WHERE created_at >= NOW() - INTERVAL '10 minutes'
+            AND status IN ('filled','closed','closing')
+          ORDER BY created_at DESC LIMIT 10
+        `),
       ]);
+
       res.write(`event: status\ndata: ${JSON.stringify({
         wallets: parseInt(wallets.rows[0].c),
         positions: `${open}/${config.trading.maxPositions}`,
         circuit_breaker: cb,
         pnl: daily.toFixed(2),
       })}\n\n`);
+
+      // Replay recent log events so reconnecting clients don't miss activity
+      for (const ev of [...recentEvents.rows].reverse()) {
+        const sev = ev.severity || ev.event_type || 'info';
+        res.write(`event: log\ndata: ${JSON.stringify({ severity: sev, message: `[replay] ${ev.message}` })}\n\n`);
+      }
+
+      // Replay recent trade events
+      for (const tr of [...recentTrades.rows].reverse()) {
+        const action = tr.status === 'filled' ? 'executed' : tr.status === 'failed' ? 'failed' : 'skipped';
+        res.write(`event: trade\ndata: ${JSON.stringify({ action, token: tr.token_out, amountUsd: tr.position_size_usd })}\n\n`);
+      }
     } catch { /* ignore */ }
   }
 

@@ -5,6 +5,12 @@ export type FeedItem = {
   html: string
 }
 
+export type WsStatus = {
+  status: 'connected' | 'disconnected' | 'connecting'
+  endpoint: string
+  attempt: number
+}
+
 export type DashState = {
   blk: number
   sig: number
@@ -16,4 +22,5 @@ export type DashState = {
   sellC: number
   connected: boolean
   tradeReload: number
+  wsStatus: WsStatus | null
 }

@@ -55,7 +55,9 @@ services:
 
       # Blockchain RPC
       ALCHEMY_API_KEY: ${ALCHEMY_API_KEY}
-      ARBITRUM_RPC: wss://arb-mainnet.g.alchemy.com/v2/${ALCHEMY_API_KEY}
+      # Alchemy as secondary fallback; publicnode is primary (Alchemy monthly limit often exhausted)
+      ARBITRUM_RPC: wss://arbitrum-one-rpc.publicnode.com
+      ARBITRUM_HTTP_RPC: https://arbitrum.publicnode.com
 
       # Wallet
       PRIVATE_KEY: ${PRIVATE_KEY}

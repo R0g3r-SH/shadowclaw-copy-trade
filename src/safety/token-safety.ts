@@ -28,6 +28,10 @@ const WHITELIST = new Set([
   '0x5979d7b546e38e414f7e9822514be443a4800529', // wstETH
 ]);
 
+function shouldBlockToken(isHoneypot: boolean, isBlacklisted: boolean): boolean {
+  return isHoneypot || isBlacklisted;
+}
+
 function whitelistResult(tokenAddress: string): SafetyResult {
   return {
     tokenAddress,
@@ -229,11 +233,12 @@ export class TokenSafetyChecker {
     // Cap risk score at 100
     riskScore = Math.min(riskScore, 100);
 
-    // Hard block only for absolute technical constraints — agent decides everything else
-    const shouldBlock = isHoneypot && liquidityUsd === 0;
+    // Block on confirmed honeypot or blacklist — these are non-negotiable regardless of liquidity.
+    // High-risk-score tokens (riskScore >= maxRiskScore) are soft-blocked via agent prompt rules.
+    const shouldBlock = shouldBlockToken(isHoneypot, isBlacklisted);
 
     if (shouldBlock) {
-      reasons.unshift(`BLOCKED: Honeypot + zero liquidity — cannot trade`);
+      reasons.unshift('BLOCKED: honeypot or blacklisted — cannot trade');
     }
 
     return {
@@ -250,7 +255,7 @@ export class TokenSafetyChecker {
   }
 
   private formatCachedResult(cached: any): SafetyResult {
-    const shouldBlock = cached.is_honeypot && cached.liquidity_usd === 0;
+    const shouldBlock = shouldBlockToken(cached.is_honeypot, cached.is_blacklisted);
     const reasons: string[] = [];
 
     if (cached.is_honeypot) reasons.push('Honeypot detected');

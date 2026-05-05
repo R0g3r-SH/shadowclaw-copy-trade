@@ -144,6 +144,9 @@ export class DatabaseService {
       amountOut?: string;
       gasCostUsd?: number;
       pnl?: number;
+      pnlPct?: number;
+      sellReason?: string;
+      closedAt?: Date;
     }
   ): Promise<void> {
     const sets: string[] = [];
@@ -173,6 +176,18 @@ export class DatabaseService {
     if (updates.pnl !== undefined) {
       sets.push(`pnl = $${paramIndex++}`);
       values.push(updates.pnl);
+    }
+    if (updates.pnlPct !== undefined) {
+      sets.push(`pnl_pct = $${paramIndex++}`);
+      values.push(updates.pnlPct);
+    }
+    if (updates.sellReason) {
+      sets.push(`sell_reason = $${paramIndex++}`);
+      values.push(updates.sellReason);
+    }
+    if (updates.closedAt) {
+      sets.push(`closed_at = $${paramIndex++}`);
+      values.push(updates.closedAt);
     }
 
     if (sets.length === 0) return;
@@ -269,7 +284,7 @@ export class DatabaseService {
     const result = await this.query(
       `SELECT COALESCE(SUM(pnl), 0) as total_pnl
        FROM copied_trades
-       WHERE created_at > NOW() - INTERVAL '24 hours'`
+       WHERE status = 'closed' AND closed_at > NOW() - INTERVAL '24 hours'`
     );
     return parseFloat(result.rows[0].total_pnl);
   }
@@ -278,16 +293,23 @@ export class DatabaseService {
     const result = await this.query(
       `SELECT COALESCE(SUM(pnl), 0) as total_pnl
        FROM copied_trades
-       WHERE created_at > NOW() - INTERVAL '1 hour'`
+       WHERE status = 'closed' AND closed_at > NOW() - INTERVAL '1 hour'`
     );
     return parseFloat(result.rows[0].total_pnl);
+  }
+
+  async updatePeakPnlPct(id: number, peakPnlPct: number): Promise<void> {
+    await this.query(
+      `UPDATE copied_trades SET peak_pnl_pct = $1 WHERE id = $2`,
+      [peakPnlPct, id]
+    );
   }
 
   async getOpenPositions(): Promise<number> {
     const result = await this.query(
       `SELECT COUNT(*) as count
        FROM copied_trades
-       WHERE status IN ('filled', 'partial')`
+       WHERE status IN ('filled', 'partial', 'closing')`
     );
     return parseInt(result.rows[0].count);
   }

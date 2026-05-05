@@ -42,12 +42,28 @@ export class TelegramBotService {
 
       // Handle approval responses first
       if (text === 'si' || text === 'yes' || text === 'y' || text === 'sí') {
-        this.handleApprovalResponse(msg.reply_to_message?.message_id, true);
+        const replyId = msg.reply_to_message?.message_id;
+        const targetId = replyId ?? (this.pendingApprovals.size === 1 ? [...this.pendingApprovals.keys()][0] : undefined);
+        if (!targetId && this.pendingApprovals.size > 1) {
+          await this.send(
+            `⚠️ Hay ${this.pendingApprovals.size} aprobaciones pendientes. Responde directamente al mensaje de aprobación que quieres aprobar.`,
+          );
+          return;
+        }
+        this.handleApprovalResponse(targetId, true);
         return;
       }
 
       if (text === 'no' || text === 'n') {
-        this.handleApprovalResponse(msg.reply_to_message?.message_id, false);
+        const replyId = msg.reply_to_message?.message_id;
+        const targetId = replyId ?? (this.pendingApprovals.size === 1 ? [...this.pendingApprovals.keys()][0] : undefined);
+        if (!targetId && this.pendingApprovals.size > 1) {
+          await this.send(
+            `⚠️ Hay ${this.pendingApprovals.size} aprobaciones pendientes. Responde directamente al mensaje que quieres rechazar.`,
+          );
+          return;
+        }
+        this.handleApprovalResponse(targetId, false);
         return;
       }
 
@@ -155,29 +171,46 @@ export class TelegramBotService {
 
   async requestApproval(
     message: string,
-    timeoutMs: number = 300000 // 5 minutes
-  ): Promise<boolean> {
-    // Send message with inline keyboard
+    timeoutMs: number = 300000,
+    onTimeout?: () => void,
+  ): Promise<{ approved: boolean; timedOut: boolean }> {
     const msg = await this.bot.sendMessage(this.chatId, message, {
+      parse_mode: 'Markdown',
       reply_markup: {
         inline_keyboard: [[
-          { text: '✅ Approve', callback_data: `approve:${Date.now()}` },
-          { text: '❌ Reject', callback_data: `reject:${Date.now()}` },
+          { text: '✅ Aprobar', callback_data: `approve:${Date.now()}` },
+          { text: '❌ Rechazar', callback_data: `reject:${Date.now()}` },
         ]],
       },
     });
 
     const messageId = msg.message_id;
 
-    // Create promise that resolves when user responds
     return new Promise((resolve) => {
-      const timeout = setTimeout(() => {
+      const timeout = setTimeout(async () => {
         this.pendingApprovals.delete(messageId);
         logger.warn(`Approval request timed out for message ${messageId}`);
-        resolve(false); // Timeout = reject
+        // Remove keyboard and notify
+        try {
+          await this.bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: this.chatId, message_id: messageId });
+          await this.send(`⏰ *Aprobación expirada*\n\nNo hubo respuesta en ${Math.round(timeoutMs / 60000)} minutos. Trade cancelado.`, { parse_mode: 'Markdown' });
+        } catch { /* ignore */ }
+        onTimeout?.();
+        resolve({ approved: false, timedOut: true });
       }, timeoutMs);
 
-      this.pendingApprovals.set(messageId, { resolve, timeout });
+      this.pendingApprovals.set(messageId, {
+        resolve: (approved: boolean) => {
+          // Send confirmation on reject (approve already shows keyboard update)
+          if (!approved) {
+            this.send('❌ *Trade rechazado.* No se ejecutará.', { parse_mode: 'Markdown' }).catch(() => {});
+          } else {
+            this.send('✅ *Aprobado — ejecutando trade ahora...*', { parse_mode: 'Markdown' }).catch(() => {});
+          }
+          resolve({ approved, timedOut: false });
+        },
+        timeout,
+      });
     });
   }
 

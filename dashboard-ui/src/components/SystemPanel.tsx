@@ -1,10 +1,11 @@
 import { Panel } from './Panel'
 import type { StatusData } from '../hooks/useAPI'
 import { useDiscovery, useLLMStats } from '../hooks/useAPI'
+import type { WsStatus } from '../types'
 
-type Props = { data: StatusData | null }
+type Props = { data: StatusData | null; wsStatus?: WsStatus | null }
 
-export function SystemPanel({ data }: Props) {
+export function SystemPanel({ data, wsStatus }: Props) {
   const cb = data?.circuit_breaker ?? false
   const { data: disc } = useDiscovery()
   const { data: llm }  = useLLMStats()
@@ -66,6 +67,37 @@ export function SystemPanel({ data }: Props) {
             <span style={{ color: '#ffd60a', fontSize: 9 }}>
               {disc!.pending_promotion} wallets
             </span>
+          </Row>
+        )}
+      </div>
+
+      {/* WebSocket status */}
+      <div style={{ marginTop: 4, paddingTop: 4, borderTop: '1px solid rgba(0,255,159,.07)' }}>
+        <div style={{ fontSize: 8, color: 'rgba(0,255,159,.35)', letterSpacing: '2px', marginBottom: 3 }}>WEBSOCKET</div>
+        {wsStatus ? (
+          <>
+            <Row label="STATUS">
+              <span style={{
+                fontSize: 9, fontWeight: 700,
+                color: wsStatus.status === 'connected' ? '#00ff9f' : wsStatus.status === 'connecting' ? '#ffd60a' : '#ff2d55',
+              }}>
+                {wsStatus.status === 'connected' ? '● LIVE' : wsStatus.status === 'connecting' ? '○ CONECTANDO' : '✕ CAÍDO'}
+              </span>
+            </Row>
+            <Row label="ENDPOINT">
+              <span style={{ color: 'rgba(0,255,159,.5)', fontSize: 8, maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {wsStatus.endpoint}
+              </span>
+            </Row>
+            {wsStatus.status !== 'connected' && wsStatus.attempt > 0 && (
+              <Row label="INTENTO">
+                <span style={{ color: '#ffd60a', fontSize: 9 }}>{wsStatus.attempt}/30</span>
+              </Row>
+            )}
+          </>
+        ) : (
+          <Row label="STATUS">
+            <span style={{ color: 'rgba(0,255,159,.3)', fontSize: 9 }}>--</span>
           </Row>
         )}
       </div>
