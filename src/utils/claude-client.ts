@@ -47,6 +47,10 @@ export async function callClaude(params: {
   source?: string;
 }): Promise<ClaudeResponse> {
 
+  if (!AZURE_URL) {
+    throw new Error('Claude endpoint not configured: set AZURE_FOUNDRY_ENDPOINT or ANTHROPIC_FOUNDRY_RESOURCE in .env');
+  }
+
   const body: any = {
     model: config.apis.azure.model,
     max_tokens: params.max_tokens || 4096,

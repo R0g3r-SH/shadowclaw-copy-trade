@@ -47,7 +47,7 @@ export const config = {
       foundryEndpoint: process.env.AZURE_FOUNDRY_ENDPOINT ||
         (process.env.ANTHROPIC_FOUNDRY_RESOURCE
           ? `https://${process.env.ANTHROPIC_FOUNDRY_RESOURCE}.services.ai.azure.com/anthropic/v1/messages`
-          : 'https://your-resource.services.ai.azure.com/anthropic/v1/messages'),
+          : ''),
       apiVersion: '2024-12-01-preview',
     },
     nansen: {
