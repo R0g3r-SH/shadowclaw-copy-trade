@@ -146,7 +146,9 @@ export class RedisService {
 
   async getLastSignalTime(): Promise<number> {
     const val = await this.get('monitor:last_signal');
-    return val ? parseInt(val) : Date.now();
+    // Return epoch 0 when key missing so BriefingAgent inactivity check fires correctly.
+    // Returning Date.now() would make minutesSince = 0 and suppress the alert indefinitely.
+    return val ? parseInt(val) : 0;
   }
 
   // Pending approvals

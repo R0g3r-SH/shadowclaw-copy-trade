@@ -175,7 +175,7 @@ export class WebSocketMonitor {
 
       // Organic discovery: observe every wallet that trades on DEXes (before tracked filter)
       if (this.discovery && !this.isTrackedWallet(tx.from)) {
-        this.discovery.observeSwap(tx.from).catch(() => {});
+        this.discovery.observeSwap(tx.from).catch(e => logger.warn({ e }, 'observeSwap failed'));
         return; // Not tracked yet — observe only, don't copy
       }
 
@@ -288,6 +288,7 @@ export class WebSocketMonitor {
     try {
       switch (selector) {
         case SWAP_SELECTORS.exactInputSingle:        return this.decodeExactInputSingle(input, txTo);
+        case SWAP_SELECTORS.exactOutputSingle:       return this.decodeExactOutputSingle(input, txTo);
         case SWAP_SELECTORS.exactInput:              return this.decodeExactInput(input, txTo);
         case SWAP_SELECTORS.swapExactTokensForTokens:return this.decodeSwapExactTokens(input);
         case SWAP_SELECTORS.swapExactETHForTokens:   return this.decodeSwapExactETH(input, value);
@@ -370,6 +371,35 @@ export class WebSocketMonitor {
         return { tokenIn: p.tokenIn, tokenOut: p.tokenOut, amountIn: p.amountIn };
       }
     } catch (error) {
+      return null;
+    }
+  }
+
+  private decodeExactOutputSingle(input: string, txTo: string): {
+    tokenIn: string;
+    tokenOut: string;
+    amountIn: bigint;
+  } | null {
+    try {
+      const params = `0x${input.slice(10)}` as `0x${string}`;
+      const isOldRouter = txTo.toLowerCase() === ROUTERS.uniswapV3.toLowerCase();
+
+      if (isOldRouter) {
+        const decoded = decodeAbiParameters(
+          parseAbiParameters('(address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 deadline, uint256 amountOut, uint256 amountInMaximum, uint160 sqrtPriceLimitX96)'),
+          params
+        );
+        const [p] = decoded;
+        return { tokenIn: p.tokenIn, tokenOut: p.tokenOut, amountIn: p.amountInMaximum };
+      } else {
+        const decoded = decodeAbiParameters(
+          parseAbiParameters('(address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountOut, uint256 amountInMaximum, uint160 sqrtPriceLimitX96)'),
+          params
+        );
+        const [p] = decoded;
+        return { tokenIn: p.tokenIn, tokenOut: p.tokenOut, amountIn: p.amountInMaximum };
+      }
+    } catch {
       return null;
     }
   }

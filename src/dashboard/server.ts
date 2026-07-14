@@ -184,9 +184,11 @@ export class DashboardServer {
         const winRate = totalTrades > 0
           ? Math.round((parseInt(row.winning_trades) / totalTrades) * 100)
           : 0;
-        const profitFactor = parseFloat(row.gross_loss) > 0
-          ? parseFloat(row.gross_profit) / parseFloat(row.gross_loss)
-          : 0;
+        const grossLoss   = parseFloat(row.gross_loss);
+        const grossProfit = parseFloat(row.gross_profit);
+        const profitFactor = grossLoss > 0
+          ? (grossProfit / grossLoss).toFixed(2)
+          : grossProfit > 0 ? '∞' : 'N/A';
 
         this.json(res, {
           wallet:       walletAddress,
@@ -195,7 +197,7 @@ export class DashboardServer {
           total_pnl:    parseFloat(row.total_pnl).toFixed(2),
           total_trades: totalTrades,
           win_rate:     winRate,
-          profit_factor: profitFactor.toFixed(2),
+          profit_factor: profitFactor,
         });
       } catch (e) {
         this.json(res, { error: String(e) });

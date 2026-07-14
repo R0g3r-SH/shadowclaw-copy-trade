@@ -138,6 +138,12 @@ export function validateConfig(): void {
       `Missing required environment variables:\n${missing.map(m => `  - ${m.key}`).join('\n')}`
     );
   }
+
+  if (!config.apis.oneInch.apiKey) {
+    // Not a hard error — system starts, but all buy trades will fail at the swap-build step.
+    // Get a free key at https://portal.1inch.dev
+    console.warn('⚠️  ONEINCH_API_KEY is not set — buy trade execution will fail. Set it in .env to enable trading.');
+  }
 }
 
 // DEX Router Addresses on Arbitrum
@@ -158,6 +164,7 @@ export const ROUTERS = {
 // Function Selectors for DEX swaps (used for decode; new routers use observe-only fallback)
 export const SWAP_SELECTORS = {
   exactInputSingle:        '0x414bf389', // Uniswap V3
+  exactOutputSingle:       '0xb858183f', // Uniswap V3
   exactInput:              '0xc04b8d59', // Uniswap V3 multi-hop
   swapExactTokensForTokens:'0x38ed1739', // Uniswap V2
   swapExactETHForTokens:   '0x7ff36ab5', // Uniswap V2

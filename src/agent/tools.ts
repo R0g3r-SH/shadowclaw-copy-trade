@@ -46,17 +46,15 @@ export const tools: Anthropic.Tool[] = [
   },
   {
     name: 'execute_trade',
-    description: 'Execute the copy trade immediately. Use when you are confident this is a good trade.',
+    description: 'Execute the copy trade immediately. Use when you are confident this is a good trade. token_in is always USDC; slippage is derived from risk_score automatically.',
     input_schema: {
       type: 'object',
       properties: {
-        token_in:   { type: 'string', description: 'Input token address (0x...)' },
-        token_out:  { type: 'string', description: 'Output token address (0x...)' },
+        token_out:  { type: 'string', description: 'Output token address (0x...) — the token to buy' },
         amount_usd: { type: 'number', description: 'Amount in USD to trade. Must not exceed max_safe_position_usd from portfolio status.' },
-        slippage_pct: { type: 'number', description: 'Slippage tolerance % (e.g. 1.0 = 1%). Use higher for volatile tokens.' },
         reasoning:  { type: 'string', description: 'Why you are executing this trade' },
       },
-      required: ['token_in', 'token_out', 'amount_usd', 'slippage_pct', 'reasoning'],
+      required: ['token_out', 'amount_usd', 'reasoning'],
     },
   },
   {

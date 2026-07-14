@@ -511,7 +511,7 @@ Personalidad:
     if (reason) {
       await this.db.logEvent('system', 'info', `Wallet agregada: ${address} — ${reason}`);
     }
-    this.onWalletChanged?.().catch(() => {});
+    this.onWalletChanged?.().catch(e => logger.warn({ e }, 'reloadWallets callback failed (add)'));
     return { success: true, address, label: finalLabel, reason };
   }
 
@@ -522,7 +522,7 @@ Personalidad:
     );
     if (result.rows.length === 0) return { error: 'Wallet no encontrada.' };
     await this.db.logEvent('system', 'info', `Wallet removida: ${address}`);
-    this.onWalletChanged?.().catch(() => {});
+    this.onWalletChanged?.().catch(e => logger.warn({ e }, 'reloadWallets callback failed (remove)'));
     return { success: true, address, label: result.rows[0].label };
   }
 
